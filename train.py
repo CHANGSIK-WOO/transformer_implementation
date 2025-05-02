@@ -32,6 +32,80 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import warnings
 
+#validation
+def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_state, writer, run_examples=2):
+    model.eval() # evaluation mode
+    count = 0
+
+    source_texts = []
+    expected = []
+    predicted = []
+
+    # size of the control window (just use a default value)
+    console_width = 80
+
+    with torch.no_grad(): #un-activating all calculation for updating gradients in model.
+        for batch in validation_ds:
+            count += 1
+            encoder_input = batch["encoder_input"].to(device)
+            encoder_mask = batch["encoder_mask"].to(device)
+
+            assert encoder_input.shape[0] == 1, "Batch Size must be 1 for validation"
+
+            model_out = greedy_decode(model, encoder_input, encoder_mask, tokenizer_src, tokenizer_tgt, max_len, device)
+
+            source_text = batch["src_text"][0]
+            target_text = batch["tgt_text"][0]
+            model_out_text = tokenizer_tgt.decode(model_out.detach().cpu().numpy())
+
+            source_texts.append(source_text)
+            expected.append(target_text)
+            predicted.append(model_out_text)
+
+            #print to the console
+            print_msg("-" * console_width)
+            print_msg(f"source : {source_text}")
+            print_msg(f"target : {target_text}")
+            print_msg(f"predicted : {model_out_text}")
+
+            if count == num_examples:
+                break
+
+
+
+def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device):
+    sos_idx = tokenizer_tgt.token_to_id('[SOS]')
+    eos_idx = tokenizer_tgt.token_to_id('[EOS]')
+
+    # Precompute the encoder output and reuse it for every step
+    encoder_output = model.encode(source, source_mask)
+    # Initialize the decoder input with the sos token
+    decoder_input = torch.empty(1, 1).fill_(sos_idx).type_as(source).to(device)
+    while True:
+        if decoder_input.size(1) == max_len:
+            break
+
+        # build mask for target
+        decoder_mask = causal_mask(decoder_input.size(1)).type_as(source_mask).to(device)
+
+        # calculate output
+        out = model.decode(encoder_output, source_mask, decoder_input, decoder_mask)
+
+        # get next token
+        prob = model.project(out[:, -1])
+        _, next_word = torch.max(prob, dim=1)
+        decoder_input = torch.cat(
+            [decoder_input, torch.empty(1, 1).type_as(source).fill_(next_word.item()).to(device)], dim=1
+        )
+
+        if next_word == eos_idx:
+            break
+
+    return decoder_input.squeeze(0)
+
+
+
+
 # Generator of returning sentence sequentially from ds
 def get_all_sentences(ds, lang):
     for item in ds:
@@ -188,6 +262,8 @@ def train_model(config):
             #update the weights
             optimizer.step() # 계산된 gradient를 이용해서 파라미터를 실제로 업데이트
             optimizer.zero_grad() # 다음 학습을 위해 기존 gradient 초기화
+
+            run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, config["seq_len"], device, lambda msg : batch_iterator.write(msg), global_stepge, writer, run_examples=2)
 
             global_step += 1
 
